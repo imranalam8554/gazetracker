@@ -1,11 +1,26 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import * as WebGazerModule from "webgazer";
+
+const WebGazer = WebGazerModule?.default ?? WebGazerModule ?? null;
 
 const FocusTracker = () => {
   const statusBoxRef = useRef(null);
   const contentBoxRef = useRef(null);
   const videoRef = useRef(null);
   const webgazerInitialized = useRef(false);
-  const cleanupFunctions = useRef([]);
+
+  // Spacebar pause/play handler (global while component mounted) + quick cal keys
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code === 'Space' && videoRef.current) {
+        e.preventDefault();
+        if (videoRef.current.paused) videoRef.current.play().catch(() => {});
+        else videoRef.current.pause();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const [status, setStatus] = useState("Initializing...");
   const [isLoading, setIsLoading] = useState(true);
@@ -16,9 +31,11 @@ const FocusTracker = () => {
 
   const gazeHistory = useRef([]);
   const focusStart = useRef(Date.now());
+  const outsideStart = useRef(null);
   const lastGazeTime = useRef(Date.now());
   const animationFrameId = useRef(null);
   const isCalibrated = useRef(false);
+  const calibrationMatrix = useRef(null); // {a,b,c,d,e,f}
 
   const MAX_HISTORY = 25;
   const DISTRACT_TIME = 1000;
@@ -30,16 +47,21 @@ const FocusTracker = () => {
     if (!contentBoxRef.current) return null;
     try {
       const rect = contentBoxRef.current.getBoundingClientRect();
-      const baseMarginX = rect.width * 0.08;
-      const baseMarginY = rect.height * 0.08;
-      const confidenceMultiplier = isCalibrated.current ? 0.7 : 1.2;
+      // Use smaller base margins so the active area isn't too narrow
+      const baseMarginX = rect.width * 0.04;
+      const baseMarginY = rect.height * 0.04;
+      const confidenceMultiplier = isCalibrated.current ? 0.6 : 1.0;
       const marginX = baseMarginX * confidenceMultiplier;
       const marginY = baseMarginY * confidenceMultiplier;
+      const xMin = rect.left + Math.min(marginX, rect.width * 0.45);
+      const xMax = rect.right - Math.min(marginX, rect.width * 0.45);
+      const yMin = rect.top + Math.min(marginY, rect.height * 0.45);
+      const yMax = rect.bottom - Math.min(marginY, rect.height * 0.45);
       return {
-        xMin: rect.left + marginX,
-        xMax: rect.right - marginX,
-        yMin: rect.top + marginY,
-        yMax: rect.bottom - marginY,
+        xMin,
+        xMax,
+        yMin,
+        yMax,
         centerX: rect.left + rect.width / 2,
         centerY: rect.top + rect.height / 2,
         width: rect.width,
@@ -71,6 +93,16 @@ const FocusTracker = () => {
     smoothedGaze.current.x = smoothedGaze.current.x * (1 - SMOOTHING_FACTOR) + newX * SMOOTHING_FACTOR;
     smoothedGaze.current.y = smoothedGaze.current.y * (1 - SMOOTHING_FACTOR) + newY * SMOOTHING_FACTOR;
     return smoothedGaze.current;
+  }, []);
+
+  // Apply calibration affine transform if available
+  const applyCalibration = useCallback((x, y) => {
+    const m = calibrationMatrix.current;
+    if (!m) return { x, y };
+    return {
+      x: m.a * x + m.b * y + m.c,
+      y: m.d * x + m.e * y + m.f
+    };
   }, []);
 
   const showAlert = useCallback(() => {
@@ -106,46 +138,96 @@ const FocusTracker = () => {
 
   const lastProcessTime = useRef(0);
   const processGazeData = useCallback((data, elapsedTime) => {
-    if (!data || !data.x || !data.y || isNaN(data.x) || isNaN(data.y)) return;
+    if (!data) return;
     const now = Date.now();
     if (now - lastProcessTime.current < THROTTLE_DELAY) return;
     lastProcessTime.current = now;
 
     lastGazeTime.current = now;
-    const clampedX = clamp(data.x, 0, window.innerWidth);
-    const clampedY = clamp(data.y, 0, window.innerHeight);
-    const smoothed = smoothGaze(clampedX, clampedY);
-    gazeHistory.current.push({ x: smoothed.x, y: smoothed.y, timestamp: now });
+    // Some webgazer builds provide pixel coords, others normalized (0..1), others page coords.
+    let rawX = data.x ?? data.pageX ?? data.screenX ?? data.xCoord ?? null;
+    let rawY = data.y ?? data.pageY ?? data.screenY ?? data.yCoord ?? null;
+    if (rawX === null || rawY === null) return;
+
+    let clientX = rawX;
+    let clientY = rawY;
+
+    // Normalized (0..1)
+    if (rawX >= 0 && rawX <= 1 && rawY >= 0 && rawY <= 1) {
+      clientX = rawX * window.innerWidth;
+      clientY = rawY * window.innerHeight;
+    } else if (rawX > window.innerWidth || rawY > window.innerHeight) {
+      // If values exceed viewport size, assume page/document coords and convert to client coords
+      clientX = rawX - (window.scrollX || document.documentElement.scrollLeft || 0);
+      clientY = rawY - (window.scrollY || document.documentElement.scrollTop || 0);
+    }
+
+    const clampedX = clamp(clientX, 0, window.innerWidth);
+    const clampedY = clamp(clientY, 0, window.innerHeight);
+    let smoothed = smoothGaze(clampedX, clampedY);
+    // Apply calibration correction if present
+    const calibrated = applyCalibration(smoothed.x, smoothed.y);
+    smoothed = { x: calibrated.x, y: calibrated.y };
+    // Normalized percentages across the viewport (0..1)
+    const pctX = clamp(smoothed.x / Math.max(1, window.innerWidth), 0, 1);
+    const pctY = clamp(smoothed.y / Math.max(1, window.innerHeight), 0, 1);
+    gazeHistory.current.push({ x: smoothed.x, y: smoothed.y, pctX, pctY, timestamp: now });
     if (gazeHistory.current.length > MAX_HISTORY) gazeHistory.current.shift();
     if (gazeHistory.current.length < 5) return;
 
-    const recentGazes = gazeHistory.current.slice(-10);
-    const avgX = getWeightedAverage(recentGazes.map(p => p.x));
-    const avgY = getWeightedAverage(recentGazes.map(p => p.y));
-    if (avgX === null || avgY === null) return;
+  const recentGazes = gazeHistory.current.slice(-10);
+  const avgX = getWeightedAverage(recentGazes.map(p => p.x));
+  const avgY = getWeightedAverage(recentGazes.map(p => p.y));
+  const avgPctX = getWeightedAverage(recentGazes.map(p => p.pctX));
+  const avgPctY = getWeightedAverage(recentGazes.map(p => p.pctY));
+  if (avgX === null || avgY === null || avgPctX === null || avgPctY === null) return;
 
-    const bounds = getContentBounds();
+  const bounds = getContentBounds();
     if (!bounds) return;
 
-    const isInBounds = avgX >= bounds.xMin && avgX <= bounds.xMax && avgY >= bounds.yMin && avgY <= bounds.yMax;
+    // Optional debug logging if enabled by setting window.__GAZE_DEBUG = true in console
+    try { if (window.__GAZE_DEBUG) console.debug('gaze', { rawX, rawY, smoothed, pctX, pctY, avgPctX, avgPctY, bounds }); } catch (e) {}
 
-    if (isInBounds) focusConfidence.current = Math.min(1, focusConfidence.current + 0.1);
-    else focusConfidence.current = Math.max(0, focusConfidence.current - 0.05);
+    // Convert content bounds to viewport percentages so checks are resolution-independent
+    const contentPctXMin = clamp(bounds.xMin / Math.max(1, window.innerWidth), 0, 1);
+    const contentPctXMax = clamp(bounds.xMax / Math.max(1, window.innerWidth), 0, 1);
+    const contentPctYMin = clamp(bounds.yMin / Math.max(1, window.innerHeight), 0, 1);
+    const contentPctYMax = clamp(bounds.yMax / Math.max(1, window.innerHeight), 0, 1);
 
-    const isFocused = focusConfidence.current > 0.3;
+    // Hysteresis margin to avoid flicker near edges
+    const edgeMargin = 0.03; // 3% margin
+    const inX = avgPctX >= (contentPctXMin + edgeMargin) && avgPctX <= (contentPctXMax - edgeMargin);
+    const inY = avgPctY >= (contentPctYMin + edgeMargin) && avgPctY <= (contentPctYMax - edgeMargin);
+    const isInBounds = inX && inY;
 
-    if (isFocused) {
-  setStatus("Focused ✅");
+    // Update confidence
+    if (isInBounds) {
+      focusConfidence.current = Math.min(1, focusConfidence.current + 0.12);
+      outsideStart.current = null; // reset outside timer
+    } else {
+      focusConfidence.current = Math.max(0, focusConfidence.current - 0.06);
+      // start outside timer if not already started
+      if (!outsideStart.current) outsideStart.current = now;
+    }
+
+    const isFocused = focusConfidence.current > 0.35;
+
+    // If gaze is focused inside bounds, ensure video plays
+    if (isInBounds || isFocused) {
+      setStatus("Focused ✅");
       focusStart.current = now;
       if (videoRef.current?.paused) videoRef.current.play().catch(err => console.warn("Could not play video:", err));
-    } else if (now - focusStart.current > DISTRACT_TIME) {
-  setStatus("Distracted ❌");
+    }
+
+    // If gaze has been outside the content area for longer than DISTRACT_TIME, pause
+    if (outsideStart.current && (now - outsideStart.current) > DISTRACT_TIME) {
+      setStatus("Distracted ❌");
       if (videoRef.current && !videoRef.current.paused) {
         videoRef.current.pause();
         showAlert();
       }
     }
-  }, [getContentBounds, clamp, getWeightedAverage, smoothGaze, showAlert]);
+  }, [applyCalibration, getContentBounds, clamp, getWeightedAverage, smoothGaze, showAlert]);
 
   const checkGazeTimeout = useCallback(() => {
     const now = Date.now();
@@ -158,20 +240,46 @@ const FocusTracker = () => {
 
   const initializeWebGazer = useCallback(async () => {
     if (webgazerInitialized.current) return;
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    const webgazerApi = WebGazer?.default ?? WebGazer ?? null;
+    if (!webgazerApi || typeof webgazerApi.begin !== 'function') {
+      setStatus("Eye tracking unavailable in this browser");
+      setIsLoading(false);
+      return;
+    }
+
     try {
-      if (!window.webgazer) throw new Error("WebGazer not loaded");
+      window.webgazer = webgazerApi;
       setStatus("Requesting camera access...");
       if (navigator.mediaDevices?.getUserMedia) {
         await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
       }
       setStatus("Initializing eye tracking...");
-      const webgazer = window.webgazer.setRegression("ridge").setTracker("TFFacemesh").saveDataAcrossSessions(true);
-      if (window.webgazer.params) {
-        window.webgazer.params.showVideo = true;
-        window.webgazer.params.showFaceOverlay = false;
-        window.webgazer.params.showFaceFeedbackBox = false;
-        window.webgazer.params.showGazeDot = false;
+      // Configure WebGazer safely. Some builds may not support all methods.
+      let webgazer = webgazerApi;
+      try {
+        if (typeof webgazer.setRegression === 'function') webgazer = webgazer.setRegression('ridge');
+      } catch (err) { console.warn('setRegression failed', err); }
+      try {
+        if (typeof webgazer.setTracker === 'function') {
+          try { webgazer = webgazer.setTracker('TFFacemesh'); } catch (err) { console.warn('setTracker TFFacemesh failed, falling back', err); }
+        }
+      } catch (err) { console.warn('setTracker failed', err); }
+      try { if (typeof webgazer.saveDataAcrossSessions === 'function') webgazer = webgazer.saveDataAcrossSessions(true); } catch (err) { console.warn('saveDataAcrossSessions failed', err); }
+      try {
+        if (window.webgazer.params) {
+          window.webgazer.params.showVideo = true;
+          window.webgazer.params.showFaceOverlay = false;
+          window.webgazer.params.showFaceFeedbackBox = false;
+          window.webgazer.params.showGazeDot = false; // we'll draw our own debug dot
+        }
+      } catch (err) { console.warn('Could not set webgazer.params', err); }
+
+      if (typeof webgazer.begin !== 'function') {
+        throw new Error("WebGazer begin() is unavailable in this environment.");
       }
+
       await webgazer.begin();
       await new Promise(resolve => setTimeout(resolve, 1000));
       let attempts = 0;
@@ -181,30 +289,27 @@ const FocusTracker = () => {
         attempts++;
       }
       if (attempts >= 15) throw new Error("WebGazer initialization timeout.");
+      // Set gaze listener and show video preview. Keep prediction points off by default.
       window.webgazer.setGazeListener(processGazeData);
-      window.webgazer.showVideoPreview(true);
-      window.webgazer.showPredictionPoints(false);
+      try { window.webgazer.showVideoPreview(true); } catch (err) { console.warn('showVideoPreview failed', err); }
+      try { window.webgazer.showPredictionPoints(false); } catch (err) { /* ignore */ }
+
+      // No on-screen debug dot created in production build (keeps UI clean)
       webgazerInitialized.current = true;
       setIsLoading(false);
       setStatus("Please look at different parts of the screen to calibrate");
       checkGazeTimeout();
     } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown WebGazer error';
       console.error("WebGazer initialization failed:", err);
-  setError(`Failed to initialize eye tracking: ${err.message}`);
+      setError(`Failed to initialize eye tracking: ${message}`);
       setIsLoading(false);
       webgazerInitialized.current = false;
     }
   }, [processGazeData, checkGazeTimeout]);
 
   const loadWebGazer = useCallback(() => {
-    if (window.webgazer) { initializeWebGazer(); return; }
-    const script = document.createElement("script");
-    script.src = "https://webgazer.cs.brown.edu/webgazer.js";
-    script.async = true;
-    script.onload = () => initializeWebGazer();
-    script.onerror = () => { setError("Failed to load eye tracking library."); setIsLoading(false); };
-    document.head.appendChild(script);
-    cleanupFunctions.current.push(() => { if (script && script.parentNode) script.parentNode.removeChild(script); });
+    initializeWebGazer();
   }, [initializeWebGazer]);
 
   const cleanup = useCallback(() => {
@@ -213,7 +318,6 @@ const FocusTracker = () => {
       if (window.webgazer && webgazerInitialized.current) {
         window.webgazer.clearGazeListener(); window.webgazer.end();
       }
-      cleanupFunctions.current.forEach(fn => { try { fn(); } catch {} });
       const alertBox = document.getElementById("alertBox");
       if (alertBox && alertBox.parentNode) alertBox.parentNode.removeChild(alertBox);
       webgazerInitialized.current = false;
@@ -221,7 +325,7 @@ const FocusTracker = () => {
     } catch {}
   }, []);
 
-  useEffect(() => { loadWebGazer(); return () => cleanup(); }, []);
+  useEffect(() => { loadWebGazer(); return () => cleanup(); }, [cleanup, loadWebGazer]);
 
   const handleVideoError = useCallback((e) => { console.warn("Video error:", e); setError("Video failed to load."); }, []);
 
@@ -257,6 +361,7 @@ const FocusTracker = () => {
           Your browser does not support video playback.
         </video>
       </div>
+      {/* Calibrate button removed per user request */}
       <div ref={statusBoxRef} style={statusStyle}>{status}</div>
     </div>
   );
